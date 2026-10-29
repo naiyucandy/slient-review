@@ -27,7 +27,7 @@ class ReportsTest {
         // This is the unchanged report JSON format written by the earlier plugin.
         Files.writeString(directory.resolve(report.id()+".json"),Review.JSON.toJson(report));
         Reports store=new Reports(directory);assertTrue(store.loadResolutions().isEmpty());
-        assertEquals(Reports.Decision.UNREVIEWED,Reports.resolution(report.id(),store.loadResolutions()).decision());
+        assertEquals(Reports.Decision.PENDING,Reports.resolution(report.id(),store.loadResolutions()).decision());
         byte[] original=Files.readAllBytes(directory.resolve(report.id()+".json"));
         var acknowledged=store.acknowledge(report.id(),Reports.Decision.CONFIRMED,"需人工补查未覆盖范围","tester");
         assertArrayEquals(original,Files.readAllBytes(directory.resolve(report.id()+".json")));
@@ -36,22 +36,37 @@ class ReportsTest {
         String markdown=Reports.markdown(store.load().get(0),acknowledged);
         assertTrue(markdown.contains("部分完成"));assertTrue(markdown.contains("不改变 AI 执行状态"));assertTrue(markdown.contains("需人工补查未覆盖范围"));
     }
-    @Test void resolutionAndAuditHistorySurviveReloadAndClosedReportRemainsVisible()throws Exception{
+    @Test void legacyFourStateResolutionsLoadAsTwoStates()throws Exception{
+        var report=report(Review.Status.COMPLETED,"/repo");Reports store=new Reports(directory);store.save(report);
+        String legacy="""
+            {"schemaVersion":1,"resolutions":{"%1$s":{"reportId":"%1$s","decision":"CLOSED","updatedAt":"2024-01-03T00:00:00Z","actor":"tester","note":"legacy","history":[
+            {"decision":"UNREVIEWED","at":"2024-01-01T00:00:00Z","actor":"tester","note":""},
+            {"decision":"ACCEPTED","at":"2024-01-02T00:00:00Z","actor":"tester","note":""},
+            {"decision":"CLOSED","at":"2024-01-03T00:00:00Z","actor":"tester","note":"legacy"}]}}}
+            """.formatted(report.id());
+        Files.writeString(directory.resolve("resolutions.json"),legacy);
+        var resolution=new Reports(directory).loadResolutions().get(report.id());
+        assertEquals(Reports.Decision.CONFIRMED,resolution.decision());
+        assertEquals(List.of(Reports.Decision.PENDING,Reports.Decision.CONFIRMED,Reports.Decision.CONFIRMED),
+            resolution.history().stream().map(Reports.AuditEvent::decision).toList());
+        assertTrue(Reports.markdown(report,resolution).contains("处理状态：已确认"));
+    }
+    @Test void resolutionAndAuditHistorySurviveReloadAndConfirmedReportRemainsVisible()throws Exception{
         var report=report(Review.Status.COMPLETED,"/repo");Reports store=new Reports(directory);store.save(report);
         store.acknowledge(report.id(),Reports.Decision.CONFIRMED,"看过了","alice");
-        store.acknowledge(report.id(),Reports.Decision.ACCEPTED,"建议已手动采纳","bob");
-        store.acknowledge(report.id(),Reports.Decision.CLOSED,"修复完成","alice");
+        store.acknowledge(report.id(),Reports.Decision.PENDING,"重新检查","bob");
+        store.acknowledge(report.id(),Reports.Decision.CONFIRMED,"看过了","alice");
         Reports reopened=new Reports(directory);var resolution=reopened.loadResolutions().get(report.id());
-        assertEquals(Reports.Decision.CLOSED,resolution.decision());assertEquals("修复完成",resolution.note());
-        assertEquals(List.of(Reports.Decision.CONFIRMED,Reports.Decision.ACCEPTED,Reports.Decision.CLOSED),resolution.history().stream().map(Reports.AuditEvent::decision).toList());
+        assertEquals(Reports.Decision.CONFIRMED,resolution.decision());assertEquals("看过了",resolution.note());
+        assertEquals(List.of(Reports.Decision.CONFIRMED,Reports.Decision.PENDING,Reports.Decision.CONFIRMED),resolution.history().stream().map(Reports.AuditEvent::decision).toList());
         assertEquals(List.of("alice","bob","alice"),resolution.history().stream().map(Reports.AuditEvent::actor).toList());
         assertEquals(1,reopened.load().size());assertFalse(resolution.updatedAt().isBlank());
         assertThrows(UnsupportedOperationException.class,()->resolution.history().clear());
-        assertTrue(Reports.markdown(report,resolution).contains("建议已手动采纳"));
+        assertTrue(Reports.markdown(report,resolution).contains("重新检查"));
     }
     @Test void confirmationOfFailureDoesNotClaimSuccessfulAiReview()throws Exception{
         var report=report(Review.Status.FAILED,"/repo");Reports store=new Reports(directory);store.save(report);
-        var resolution=store.acknowledge(report.id(),Reports.Decision.ACCEPTED,"人工记录","tester");
+        var resolution=store.acknowledge(report.id(),Reports.Decision.CONFIRMED,"人工记录","tester");
         assertEquals(Review.Status.FAILED,store.load().get(0).result().status());
         String markdown=Reports.markdown(report,resolution);
         assertTrue(markdown.contains("执行状态：执行失败"));assertTrue(markdown.contains("待补查"));assertFalse(markdown.contains("本次约定范围内的检查未发现问题"));
@@ -80,12 +95,12 @@ class ReportsTest {
     @Test void corruptAuditHistoryIsPreservedInsteadOfSilentlyOverwritten()throws Exception{
         var report=report(Review.Status.COMPLETED,"/repo");Reports store=new Reports(directory);store.save(report);
         Path state=directory.resolve("resolutions.json");Files.writeString(state,"broken audit evidence");
-        assertThrows(java.io.IOException.class,()->store.acknowledge(report.id(),Reports.Decision.CLOSED,"","tester"));
+        assertThrows(java.io.IOException.class,()->store.acknowledge(report.id(),Reports.Decision.CONFIRMED,"","tester"));
         assertEquals("broken audit evidence",Files.readString(state));assertEquals(1,store.load().size());
     }
     @Test void clearRemovesResolutionHistoryAndPreservesUnrelatedJson()throws Exception{
         var report=report(Review.Status.COMPLETED,"/repo");Reports store=new Reports(directory);store.save(report);
-        store.acknowledge(report.id(),Reports.Decision.CLOSED,"","tester");Files.writeString(directory.resolve("notes.json"),"{\"keep\":true}");
+        store.acknowledge(report.id(),Reports.Decision.CONFIRMED,"","tester");Files.writeString(directory.resolve("notes.json"),"{\"keep\":true}");
         store.clear();assertTrue(store.load().isEmpty());assertTrue(store.loadResolutions().isEmpty());
         assertFalse(Files.exists(directory.resolve("resolutions.json")));assertEquals("{\"keep\":true}",Files.readString(directory.resolve("notes.json")));
     }
@@ -97,10 +112,10 @@ class ReportsTest {
     @Test void markdownExportsAllProcessingEventsAndEscapesTableCells()throws Exception{
         var report=report(Review.Status.COMPLETED,"/repo");Reports store=new Reports(directory);store.save(report);
         store.acknowledge(report.id(),Reports.Decision.CONFIRMED,"scope | checked\nnext","alice");
-        var resolution=store.acknowledge(report.id(),Reports.Decision.UNREVIEWED,"重新检查","bob");
+        var resolution=store.acknowledge(report.id(),Reports.Decision.PENDING,"重新检查","bob");
         String markdown=Reports.markdown(report,resolution);
         assertTrue(markdown.contains("scope \\| checked<br>next"));assertTrue(markdown.contains("重新检查"));assertTrue(markdown.contains("处理状态：待处理"));
-        assertThrows(IllegalArgumentException.class,()->Reports.markdown(report,new Reports.Resolution(UUID.randomUUID().toString(),Reports.Decision.CLOSED,"","","",List.of())));
+        assertThrows(IllegalArgumentException.class,()->Reports.markdown(report,new Reports.Resolution(UUID.randomUUID().toString(),Reports.Decision.CONFIRMED,"","","",List.of())));
     }
     private static Review.Report report(Review.Status status,String root){
         var req=TestFixtures.request();var original=Review.report(req,"single","test",null,new Review.Result(List.of(),List.of(),status==Review.Status.COMPLETED?List.of():List.of("待补查"),status));

@@ -7,10 +7,13 @@ import static org.junit.jupiter.api.Assertions.*;
 class ReportFiltersTest {
     @Test void sameRevisionAndPathInDifferentRepositoriesRemainDistinctWhenFiltering(){
         Review.Report one=report("/repo-a","warning"),two=report("/repo-b","error");
-        Map<String,Reports.Resolution> states=Map.of(two.id(),new Reports.Resolution(two.id(),Reports.Decision.CLOSED,"","","",List.of()));
-        assertEquals(List.of(one),ReportFilters.select(List.of(one,two),states,"/repo-a",Reports.Decision.UNREVIEWED,"warning"));
-        assertEquals(List.of(two),ReportFilters.select(List.of(one,two),states,null,Reports.Decision.CLOSED,"error"));
-        assertEquals(List.of(one,two),ReportFilters.select(List.of(one,two),states,null,null,null));
+        Map<String,Reports.Resolution> states=Map.of(two.id(),new Reports.Resolution(two.id(),Reports.Decision.CONFIRMED,"","","",List.of()));
+        assertEquals(List.of(one),ReportFilters.select(List.of(one,two),states,Set.of("/repo-a"),Reports.Decision.PENDING,"warning"));
+        assertEquals(List.of(two),ReportFilters.select(List.of(one,two),states,(Set<String>)null,Reports.Decision.CONFIRMED,"error"));
+        assertEquals(List.of(one,two),ReportFilters.select(List.of(one,two),states,Set.of("/repo-a","/repo-b"),null,null));
+        assertEquals(List.of(two),ReportFilters.select(List.of(one,two),states,Set.of("/repo-b"),null,null));
+        assertEquals(List.of(),ReportFilters.select(List.of(one,two),states,Set.of(),null,null));
+        assertEquals(List.of(one,two),ReportFilters.select(List.of(one,two),states,(Set<String>)null,null,null));
         assertEquals(1,two.result().findings().size());assertEquals(Review.Status.COMPLETED,two.result().status());
     }
     private static Review.Report report(String root,String severity){

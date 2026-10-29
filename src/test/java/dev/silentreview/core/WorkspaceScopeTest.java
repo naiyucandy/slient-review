@@ -131,7 +131,7 @@ class WorkspaceScopeTest {
         assertTrue(file.before().isEmpty());assertEquals("class OrderService {}\n",file.after());
         assertTrue(file.diff().contains("new file mode"));assertEquals(1,prepared.tasks().size());
     }
-    @Test void scopeDiffRemainsTheFrozenSelectionAfterHeadAndWorkingTreeChange()throws Exception{
+    @Test void frozenScopeFileRemainsThePreparedSelectionAfterHeadAndWorkingTreeChange()throws Exception{
         sharedRules();Path root=repository("latin");var prepared=collect(List.of(root));var repo=prepared.state().repositories().get(0);
         var frozen=prepared.file(repo.root(),repo.head(),"src/OrderService.java");
         write(root,"src/OrderService.java","committed later\n");git(root,"add",".");git(root,"commit","-m","later");

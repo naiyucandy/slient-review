@@ -101,7 +101,6 @@ final class FishOverlay implements Disposable {
             boolean enabled=ReviewSettings.get(project).data().automatic;
             item(popup,enabled?"关闭自动审查":"开启自动审查",()->{ReviewSettings.get(project).data().automatic=!enabled;service.settingsChanged();});
             item(popup,"设置",()->ShowSettingsUtil.getInstance().showSettingsDialog(project,ReviewConfigurable.class));
-            item(popup,"隐藏大肥鱼",()->{ReviewSettings.get(project).data().fishVisible=false;refresh();});
             popup.show(this,e.getX(),e.getY());
         }
         private void item(JPopupMenu menu,String title,Runnable run){JMenuItem item=new JMenuItem(title);item.addActionListener(e->run.run());menu.add(item);}

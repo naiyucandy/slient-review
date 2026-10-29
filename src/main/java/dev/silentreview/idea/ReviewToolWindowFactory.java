@@ -1,8 +1,6 @@
 package dev.silentreview.idea;
 
-import com.intellij.diff.DiffContentFactory;
-import com.intellij.diff.DiffManager;
-import com.intellij.diff.requests.SimpleDiffRequest;
+import com.intellij.icons.AllIcons;
 import com.intellij.openapi.Disposable;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.application.ReadAction;
@@ -22,18 +20,17 @@ import javax.swing.*;
 import javax.swing.event.HyperlinkEvent;
 import javax.swing.table.AbstractTableModel;
 import java.awt.*;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import org.jetbrains.annotations.NotNull;
 
 public final class ReviewToolWindowFactory implements ToolWindowFactory,DumbAware {
     @Override public void createToolWindowContent(@NotNull Project project,@NotNull ToolWindow window){
-        Panel panel=new Panel(project,window);
+        Panel panel=new Panel(project);
         var content=ContentFactory.getInstance().createContent(panel,"提交审查",false);
         content.setDisposer(panel);window.getContentManager().addContent(content);
     }
@@ -44,8 +41,7 @@ public final class ReviewToolWindowFactory implements ToolWindowFactory,DumbAwar
         private final DefaultListModel<Review.Report> model=new DefaultListModel<>();
         private final JList<Review.Report> history=new JList<>(model);
         private final JEditorPane body=new JEditorPane("text/html","");
-        private final JComboBox<String> rootFilter=new JComboBox<>(new String[]{"全部仓库"});
-        private final JComboBox<String> decisionFilter=new JComboBox<>(new String[]{"全部处理状态","待处理","已确认","已采纳","已关闭"});
+        private final JComboBox<String> decisionFilter=new JComboBox<>(new String[]{"全部处理状态","待处理","已确认"});
         private final JComboBox<String> severityFilter=new JComboBox<>(new String[]{"全部严重级别","error","warning","info"});
         private final JTabbedPane tabs=new JTabbedPane();
         private final JLabel scopeCounts=new JLabel("尚未准备范围。先刷新范围，再选择文件并开始审查。");
@@ -53,35 +49,51 @@ public final class ReviewToolWindowFactory implements ToolWindowFactory,DumbAwar
         private final ScopeTable scopeModel=new ScopeTable();
         private final JTable scopeTable=new JTable(scopeModel);
         private final List<JButton> scopeActions=new ArrayList<>();
-        private final List<JButton> decisionActions=new ArrayList<>();
-        private JButton start;
+        private final Set<String> selectedRoots=new LinkedHashSet<>();
+        private final List<String> knownRoots=new ArrayList<>();
+        private final Set<String> selectedReportRoots=new LinkedHashSet<>();
+        private final List<String> knownReportRoots=new ArrayList<>();
+        private boolean scopeSelectionInitialized,reportSelectionInitialized;
+        private JButton start,stop,process,notProcess,repoButton,reportRootButton;
         private ReviewService.View view;
         private boolean refreshing;
         private volatile boolean disposed;
-        Panel(Project project,ToolWindow window){
+        Panel(Project project){
             super(new BorderLayout(8,8));this.project=project;service=ReviewService.get(project);view=service.view();
-            JPanel toolbar=new JPanel(new GridLayout(0,3,5,5));
-            scopeActions.add(button(toolbar,"准备当前提交",()->service.manual(null)));
-            scopeActions.add(button(toolbar,"准备分支范围",()->{
-                String reference=Messages.showInputDialog(project,"输入公共分支引用，或 @{upstream} 使用各仓库的本地上游引用。不会自动更新远端引用。","选择检查基线",null);
-                if(reference!=null&&!reference.isBlank())service.manual(reference.strip());
-            }));
-            button(toolbar,"取消当前",service::cancel);
-            button(toolbar,"设置",()->ShowSettingsUtil.getInstance().showSettingsDialog(project,ReviewConfigurable.class));
-            button(toolbar,"显示大肥鱼",()->{ReviewSettings.get(project).data().fishVisible=true;service.settingsChanged();});
-            button(toolbar,"收起面板",()->window.hide(null));
+            JPanel toolbar=new JPanel(new BorderLayout());
+            JPanel primary=new JPanel(new FlowLayout(FlowLayout.LEFT,6,4));
+            scopeActions.add(button(primary,"准备当前提交",()->service.manual(null)));
+            scopeActions.add(button(primary,"刷新范围",()->service.prepareScope(view.scope().baseline())));
+            repoButton=button(primary,"仓库：全部仓库 ▾",this::showScopeRepoMenu);
+            repoButton.setToolTipText("选择参与审查的仓库，可多选或全选");
+            scopeActions.add(repoButton);
+            toolbar.add(primary,BorderLayout.WEST);
+            JPanel settings=new JPanel(new FlowLayout(FlowLayout.RIGHT,4,4));settings.add(settingsButton());
+            toolbar.add(settings,BorderLayout.EAST);
             JPanel top=new JPanel(new BorderLayout());top.add(toolbar,BorderLayout.NORTH);top.add(status,BorderLayout.SOUTH);add(top,BorderLayout.NORTH);
             tabs.addTab("审查范围",scopePanel());tabs.addTab("报告与处理",reportPanel());add(tabs,BorderLayout.CENTER);
             service.listen(this::refresh,this);service.startFish();
         }
+        private JButton settingsButton(){
+            JButton gear=new JButton(AllIcons.General.GearPlain);
+            gear.setToolTipText("设置");gear.setFocusable(false);gear.setMargin(new Insets(2,4,2,4));
+            gear.setContentAreaFilled(false);gear.setBorderPainted(false);
+            gear.getAccessibleContext().setAccessibleName("设置");
+            gear.addActionListener(e->ShowSettingsUtil.getInstance().showSettingsDialog(project,ReviewConfigurable.class));
+            return gear;
+        }
         private JPanel scopePanel(){
             JPanel panel=new JPanel(new BorderLayout(5,5));
-            JPanel actions=new JPanel(new GridLayout(0,3,5,5));
-            scopeActions.add(button(actions,"刷新范围",()->service.prepareScope(view.scope().baseline())));
-            scopeActions.add(button(actions,"全部纳入",()->service.setAllIncluded(true)));
-            scopeActions.add(button(actions,"全部排除",()->service.setAllIncluded(false)));
-            start=button(actions,"开始审查已纳入文件",service::startPreparedReview);
-            button(actions,"查看选中文件 Diff",this::scopeDiff);
+            JPanel actions=new JPanel(new FlowLayout(FlowLayout.LEFT,6,4));
+            stop=button(actions,"停止审查",service::cancel);
+            stop.setToolTipText("停止正在进行的审查或范围准备");
+            JButton includeAll=button(actions,"全部纳入",()->service.setAllIncluded(true,Set.copyOf(selectedRoots)));
+            includeAll.setToolTipText("仅纳入已选仓库的文件");
+            JButton excludeAll=button(actions,"全部排除",()->service.setAllIncluded(false,Set.copyOf(selectedRoots)));
+            excludeAll.setToolTipText("仅排除已选仓库的文件");
+            scopeActions.add(includeAll);scopeActions.add(excludeAll);
+            start=button(actions,"开始审查",()->service.startPreparedReview(Set.copyOf(selectedRoots)));
+            start.setToolTipText("审查所选仓库中已纳入的文件");
             JPanel heading=new JPanel(new BorderLayout());heading.add(actions,BorderLayout.NORTH);heading.add(scopeCounts,BorderLayout.CENTER);
             JLabel hint=new JLabel("<html>勾选仅控制插件审查范围。<br>IDE 提交窗口的 included 数量不代表本插件的审查数量。</html>");
             heading.add(hint,BorderLayout.SOUTH);panel.add(heading,BorderLayout.NORTH);
@@ -100,22 +112,17 @@ public final class ReviewToolWindowFactory implements ToolWindowFactory,DumbAwar
         }
         private JPanel reportPanel(){
             JPanel panel=new JPanel(new BorderLayout(5,5));
-            JPanel actions=new JPanel(new GridLayout(0,3,5,5));
+            JPanel actions=new JPanel(new FlowLayout(FlowLayout.LEFT,5,5));
             JPanel filters=new JPanel(new GridLayout(0,1,5,5));
-            filters.add(rootFilter);filters.add(decisionFilter);filters.add(severityFilter);
-            rootFilter.setRenderer(new DefaultListCellRenderer(){
-                @Override public Component getListCellRendererComponent(JList<?> list,Object value,int index,boolean selected,boolean focus){
-                    JLabel label=(JLabel)super.getListCellRendererComponent(list,value,index,selected,focus);
-                    if(value instanceof String root){label.setText(root.equals("全部仓库")?root:rootName(root));label.setToolTipText(root);}return label;
-                }
-            });
-            rootFilter.addActionListener(e->applyFilters());decisionFilter.addActionListener(e->applyFilters());severityFilter.addActionListener(e->applyFilters());
-            decisionActions.add(button(actions,"确认报告",()->acknowledge(Reports.Decision.CONFIRMED)));
-            decisionActions.add(button(actions,"采纳建议",()->acknowledge(Reports.Decision.ACCEPTED)));
-            decisionActions.add(button(actions,"关闭报告",()->acknowledge(Reports.Decision.CLOSED)));
-            decisionActions.add(button(actions,"重新待处理",()->acknowledge(Reports.Decision.UNREVIEWED)));
-            button(actions,"导出所选报告",this::export);
-            button(actions,"清理历史",()->{if(Messages.showYesNoDialog(project,"删除本项目的本地报告和人工处理历史？","清理报告",null)==Messages.YES)service.clearHistory();});
+            reportRootButton=button(filters,"全部仓库 ▾",this::showReportRepoMenu);
+            reportRootButton.setHorizontalAlignment(SwingConstants.LEFT);
+            reportRootButton.setToolTipText("选择要显示报告的仓库，可多选或全选");
+            filters.add(decisionFilter);filters.add(severityFilter);
+            decisionFilter.addActionListener(e->applyFilters());severityFilter.addActionListener(e->applyFilters());
+            process=button(actions,"处理",()->acknowledge(Reports.Decision.CONFIRMED));
+            process.setToolTipText("标记为已确认");
+            notProcess=button(actions,"不处理",()->acknowledge(Reports.Decision.PENDING));
+            notProcess.setToolTipText("恢复为待处理");
             JPanel heading=new JPanel(new BorderLayout(5,5));heading.add(filters,BorderLayout.NORTH);heading.add(actions,BorderLayout.CENTER);panel.add(heading,BorderLayout.NORTH);
             history.setCellRenderer(new DefaultListCellRenderer(){
                 @Override public Component getListCellRendererComponent(JList<?> list,Object value,int index,boolean selected,boolean focus){
@@ -140,53 +147,150 @@ public final class ReviewToolWindowFactory implements ToolWindowFactory,DumbAwar
             JSplitPane split=new JSplitPane(JSplitPane.HORIZONTAL_SPLIT,new JScrollPane(history),new JScrollPane(body));split.setResizeWeight(0.28);panel.add(split,BorderLayout.CENTER);
             return panel;
         }
-        private static JButton button(JPanel parent,String title,Runnable action){JButton b=new JButton(title);b.addActionListener(e->action.run());parent.add(b);return b;}
+        private static JButton button(JPanel parent,String title,Runnable action){
+            JButton b=new JButton(title);b.addActionListener(e->action.run());
+            b.setMargin(new Insets(2,9,2,9));b.setFocusable(false);parent.add(b);return b;
+        }
         private void refresh(ReviewService.View next){
             if(disposed)return;
             if(!SwingUtilities.isEventDispatchThread()){SwingUtilities.invokeLater(()->refresh(next));return;}
             String newestBefore=view.reports().isEmpty()?null:view.reports().get(0).id();view=next;
             status.setText(Reports.label(next.status())+"："+next.message());status.setToolTipText(next.message());
             scopeActions.forEach(b->b.setEnabled(!next.busy()&&!next.scope().preparing()));
-            start.setEnabled(!next.busy()&&next.scope().ready());
-            scopeModel.rows=next.scope().repositories().stream().flatMap(r->r.files().stream()).toList();scopeModel.fireTableDataChanged();
-            var s=next.scope();
-            scopeCounts.setText("<html>共 "+s.repositories().size()+" 个仓库 / "+s.fileCount()+" 个变更文件；<br>已纳入 "+s.includedCount()+"，已排除 "+s.excludedCount()+"，可选 "+s.eligibleCount()+"，失败仓库 "+s.failedRepositoryCount()+(s.preparing()?" · 准备中":s.stale()?" · 范围已过期，请刷新":"")+"</html>");
-            StringBuilder info=new StringBuilder("审查与 Diff 都使用此处冻结的提交；不含尚未提交的编辑。\n");
-            next.discoveryNotes().forEach(note->info.append(note).append('\n'));
-            next.discoveryLimitations().forEach(warning->info.append("发现提示：").append(warning).append('\n'));
-            for(var repo:s.repositories())info.append(repo.root()).append("\n  ").append(repo.branch()).append(" · HEAD ").append(repo.head()).append(" · 基线 ").append(repo.baseline()).append(" · ").append(repo.description()).append(repo.error()==null||repo.error().isBlank()?"":" · 失败："+repo.error()).append('\n');
-            scopeInfo.setText(info.toString());scopeInfo.setCaretPosition(0);
-            refreshing=true;String oldRoot=(String)rootFilter.getSelectedItem();rootFilter.removeAllItems();rootFilter.addItem("全部仓库");
-            next.reports().stream().map(Review.Report::root).distinct().sorted().forEach(rootFilter::addItem);
-            if(oldRoot!=null)rootFilter.setSelectedItem(oldRoot);if(rootFilter.getSelectedIndex()<0)rootFilter.setSelectedIndex(0);refreshing=false;
+            stop.setEnabled(next.busy());
+            updateScopeRoots(next.scope());
+            updateScope();
+            updateReportRoots(next.reports());
+            updateReportRootButton();
             applyFilters();
             String newest=next.reports().isEmpty()?null:next.reports().get(0).id();
             if(newest!=null&&!Objects.equals(newest,newestBefore)){tabs.setSelectedIndex(1);if(model.size()>0)history.setSelectedIndex(0);}
             else if(next.scope().preparing())tabs.setSelectedIndex(0);
         }
+        private void updateScopeRoots(WorkspaceScope.State scope){
+            if(scope.preparing()&&scope.repositories().isEmpty())return;
+            List<String> roots=scope.repositories().stream().map(WorkspaceScope.Repository::root).sorted().toList();
+            boolean wasAll=scopeSelectionInitialized&&selectedRoots.containsAll(knownRoots);
+            knownRoots.clear();knownRoots.addAll(roots);
+            selectedRoots.retainAll(roots);
+            if(!scopeSelectionInitialized||wasAll)selectedRoots.addAll(roots);
+            scopeSelectionInitialized=true;
+        }
+        private void updateReportRoots(List<Review.Report> reports){
+            List<String> roots=reports.stream().map(Review.Report::root).distinct().sorted().toList();
+            boolean wasAll=reportSelectionInitialized&&selectedReportRoots.containsAll(knownReportRoots);
+            knownReportRoots.clear();knownReportRoots.addAll(roots);
+            selectedReportRoots.retainAll(roots);
+            if(!reportSelectionInitialized||wasAll)selectedReportRoots.addAll(roots);
+            reportSelectionInitialized=true;
+        }
+        private void updateScope(){
+            WorkspaceScope.State scope=view.scope();
+            List<WorkspaceScope.Repository> repositories=scope.repositories().stream()
+                .filter(r->selectedRoots.contains(r.root())).toList();
+            int files=repositories.stream().mapToInt(r->r.files().size()).sum();
+            int included=(int)repositories.stream().flatMap(r->r.files().stream()).filter(WorkspaceScope.File::included).count();
+            int eligible=(int)repositories.stream().flatMap(r->r.files().stream()).filter(WorkspaceScope.File::selectable).count();
+            int failed=(int)repositories.stream().filter(r->r.error()!=null&&!r.error().isBlank()).count();
+            String state=scope.preparing()?" · 准备中":scope.stale()?" · 范围已过期，请刷新":"";
+            if(scope.preparing()&&scope.repositories().isEmpty()){
+                scopeCounts.setText("<html>正在逐仓库收集范围…</html>");
+            }else if(repositories.isEmpty()){
+                scopeCounts.setText("<html>"+(scope.repositories().isEmpty()?"尚无仓库；请先准备当前提交。":"未选择仓库；请通过上方仓库选择器选择要审查的仓库。")+state+"</html>");
+            }else{
+                scopeCounts.setText("<html>已选 "+repositories.size()+" / "+scope.repositories().size()+" 个仓库 / "+files+" 个变更文件；<br>已纳入 "+included+"，已排除 "+(files-included)+"，可选 "+eligible+"，失败仓库 "+failed+state+"</html>");
+            }
+            scopeModel.rows=repositories.stream().flatMap(r->r.files().stream()).toList();scopeModel.fireTableDataChanged();
+            StringBuilder info=new StringBuilder("审查使用此处冻结的提交；不含尚未提交的编辑。\n");
+            view.discoveryNotes().forEach(note->info.append(note).append('\n'));
+            view.discoveryLimitations().forEach(warning->info.append("发现提示：").append(warning).append('\n'));
+            if(repositories.isEmpty())info.append("未选择仓库。\n");
+            for(var repo:repositories)info.append(repo.root()).append("\n  ").append(repo.branch()).append(" · HEAD ").append(repo.head()).append(" · 基线 ").append(repo.baseline()).append(" · ").append(repo.description()).append(repo.error()==null||repo.error().isBlank()?"":" · 失败："+repo.error()).append('\n');
+            scopeInfo.setText(info.toString());scopeInfo.setCaretPosition(0);
+            boolean hasIncluded=repositories.stream().flatMap(r->r.files().stream()).anyMatch(f->f.included()&&f.selectable());
+            start.setEnabled(!view.busy()&&scope.ready()&&hasIncluded);
+            repoButton.setEnabled(!view.busy()&&!scope.preparing()&&!scope.repositories().isEmpty());
+            updateRepoButton(repoButton,selectedRoots,knownRoots,"仓库：");
+        }
+        private void updateReportRootButton(){
+            updateRepoButton(reportRootButton,selectedReportRoots,knownReportRoots,"");
+            reportRootButton.setEnabled(!knownReportRoots.isEmpty());
+        }
+        private static void updateRepoButton(JButton button,Set<String> selected,List<String> all,String prefix){
+            String text;
+            if(all.isEmpty())text=prefix+"全部仓库";
+            else if(selected.isEmpty())text=prefix+"未选择仓库";
+            else if(selected.containsAll(all))text=prefix+"全部仓库";
+            else text=prefix+"已选 "+selected.size()+" 个仓库";
+            button.setText(text+" ▾");
+        }
+        private void showScopeRepoMenu(){
+            showRepoMenu(repoButton,List.copyOf(knownRoots),selectedRoots,this::scopeRootsChanged);
+        }
+        private void showReportRepoMenu(){
+            showRepoMenu(reportRootButton,List.copyOf(knownReportRoots),selectedReportRoots,this::reportRootsChanged);
+        }
+        private void showRepoMenu(JButton button,List<String> roots,Set<String> selected,Runnable changed){
+            JPopupMenu menu=new JPopupMenu();
+            JMenuItem all=new JMenuItem("全选");
+            all.setEnabled(!roots.isEmpty());
+            all.addActionListener(e->{selected.clear();selected.addAll(roots);changed.run();menu.setVisible(false);});
+            menu.add(all);
+            JMenuItem none=new JMenuItem("全不选");
+            none.setEnabled(!roots.isEmpty());
+            none.addActionListener(e->{selected.clear();changed.run();menu.setVisible(false);});
+            menu.add(none);
+            menu.addSeparator();
+            if(roots.isEmpty()){
+                JMenuItem empty=new JMenuItem("暂无仓库");empty.setEnabled(false);menu.add(empty);
+            }else{
+                for(String root:roots){
+                    String name=rootName(root);
+                    boolean duplicate=roots.stream().filter(other->rootName(other).equals(name)).count()>1;
+                    JCheckBoxMenuItem item=new JCheckBoxMenuItem(duplicate?name+" — "+root:name,selected.contains(root));
+                    item.setToolTipText(root);
+                    item.addActionListener(e->{
+                        if(item.isSelected())selected.add(root);else selected.remove(root);
+                        changed.run();
+                    });
+                    menu.add(item);
+                }
+            }
+            menu.show(button,0,button.getHeight());
+        }
+        private void scopeRootsChanged(){
+            updateScope();
+        }
+        private void reportRootsChanged(){
+            updateReportRootButton();
+            applyFilters();
+        }
         private void applyFilters(){
             if(refreshing)return;
             Review.Report selected=history.getSelectedValue();String id=selected==null?null:selected.id();
             Reports.Decision decision=decisionFilter.getSelectedIndex()<=0?null:Reports.Decision.values()[decisionFilter.getSelectedIndex()-1];
-            String root=rootFilter.getSelectedIndex()<=0?null:(String)rootFilter.getSelectedItem();String severity=selectedSeverity();
-            refreshing=true;model.clear();ReportFilters.select(view.reports(),view.resolutions(),root,decision,severity).forEach(model::addElement);
+            Set<String> roots=selectedReportRoots.containsAll(knownReportRoots)?null:Set.copyOf(selectedReportRoots);
+            String severity=selectedSeverity();
+            refreshing=true;model.clear();ReportFilters.select(view.reports(),view.resolutions(),roots,decision,severity).forEach(model::addElement);
             int chosen=0;for(int i=0;i<model.size();i++)if(model.get(i).id().equals(id))chosen=i;
             if(!model.isEmpty())history.setSelectedIndex(chosen);refreshing=false;render();
         }
         private String selectedSeverity(){return severityFilter.getSelectedIndex()<=0?null:(String)severityFilter.getSelectedItem();}
         private void render(){
-            Review.Report r=history.getSelectedValue();decisionActions.forEach(b->b.setEnabled(r!=null&&!view.busy()));
-            if(r==null){body.setText("<html><body><h2>静默代码检测</h2><p>在设置中创建默认规则模板并配置 AI 接口，然后准备范围、纳入文件并开始审查。</p><p>报告会按仓库独立保存。已关闭报告仍可通过处理状态筛选查看。</p><p>当前筛选下没有报告。</p></body></html>");return;}
+            Review.Report r=history.getSelectedValue();
+            if(r==null){process.setEnabled(false);notProcess.setEnabled(false);body.setText("<html><body><h2>静默代码检测</h2><p>在设置中创建默认规则模板并配置 AI 接口，然后准备范围、纳入文件并开始审查。</p><p>报告会按仓库独立保存。已确认报告仍可通过处理状态筛选查看。</p><p>当前筛选下没有报告。</p></body></html>");return;}
             Reports.Resolution resolution=Reports.resolution(r.id(),view.resolutions());
+            process.setEnabled(!view.busy()&&resolution.decision()!=Reports.Decision.CONFIRMED);
+            notProcess.setEnabled(!view.busy()&&resolution.decision()!=Reports.Decision.PENDING);
             StringBuilder html=new StringBuilder("<html><body style='font-family:sans-serif;margin:16px'><h2>提交分析报告</h2>");
             html.append("<h3>仓库：").append(escape(r.root())).append("</h3>");
             paragraph(html,"AI 执行状态",Reports.label(r.result().status()));paragraph(html,"人工处理状态",Reports.label(resolution.decision()));
-            html.append("<p><b>人工确认、采纳、关闭仅记录处理进度，不改变 AI 执行结果、覆盖状态或未完成项。采纳不会自动修改代码。</b></p>");
+            html.append("<p><b>点击“处理”标记为已确认，点击“不处理”恢复为待处理。人工处理仅记录进度，不改变 AI 执行结果、覆盖状态或未完成项。</b></p>");
             if(r.result().status()!=Review.Status.COMPLETED)html.append("<p><b>本报告未获得完整成功的 AI 检查结果，请结合限制与覆盖记录处理。</b></p>");
             paragraph(html,"时间",r.createdAt());paragraph(html,"分支",r.branch());paragraph(html,"范围",r.scope());paragraph(html,"基线",r.base());paragraph(html,"提交",r.target());
             paragraph(html,"规则集",r.ruleSetName()+" / "+r.ruleSetVersion());paragraph(html,"指纹",r.fingerprint());paragraph(html,"模型",r.model());
             html.append("<h3>人工处理历史</h3>");
-            if(resolution.history().isEmpty())html.append("<p>尚未处理。使用上方确认、采纳或关闭按钮记录处理结果。</p>");
+            if(resolution.history().isEmpty())html.append("<p>尚未处理。使用上方“处理/不处理”按钮记录处理结果。</p>");
             for(Reports.AuditEvent event:resolution.history())paragraph(html,event.at()+" · "+Reports.label(event.decision())+" · "+event.actor(),event.note().isBlank()?"无备注":event.note());
             if(r.result().status()==Review.Status.COMPLETED&&r.result().findings().isEmpty())html.append("<p>本次检查范围内未发现问题。</p>");
             String severity=selectedSeverity();
@@ -207,39 +311,14 @@ public final class ReviewToolWindowFactory implements ToolWindowFactory,DumbAwar
             html.append("</body></html>");body.setText(html.toString());body.setCaretPosition(0);
         }
         private void acknowledge(Reports.Decision decision){
-            Review.Report r=history.getSelectedValue();if(r==null)return;
-            String note=Messages.showInputDialog(project,"为报告记录“"+Reports.label(decision)+"”。备注可留空。\n这不会改变 AI 执行状态，也不会修改代码。","处理报告",null,"",null);
-            if(note!=null)service.acknowledge(r.id(),decision,note);
+            Review.Report r=history.getSelectedValue();if(r==null||view.busy())return;
+            process.setEnabled(false);notProcess.setEnabled(false);
+            service.acknowledge(r.id(),decision,"");
         }
         private static void paragraph(StringBuilder out,String label,String value){out.append("<p><b>").append(escape(label)).append("：</b>").append(escape(value).replace("\n","<br>")).append("</p>");}
         private static String escape(String s){return s==null?"":s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\"","&quot;");}
         private static String shortRevision(String revision){return revision==null?"无":revision.substring(0,Math.min(8,revision.length()));}
         private static String rootName(String root){if(root==null)return "未知仓库";try{return Path.of(root).getFileName().toString();}catch(RuntimeException e){return root;}}
-        private void export(){
-            Review.Report r=history.getSelectedValue();if(r==null)return;Reports.Resolution resolution=Reports.resolution(r.id(),view.resolutions());
-            JFileChooser chooser=new JFileChooser();chooser.setSelectedFile(new java.io.File("silent-review-"+rootName(r.root())+"-"+shortRevision(r.target())+".md"));
-            if(chooser.showSaveDialog(this)==JFileChooser.APPROVE_OPTION){
-                Path output=chooser.getSelectedFile().toPath();
-                ApplicationManager.getApplication().executeOnPooledThread(()->{try{Files.writeString(output,Reports.markdown(r,resolution),StandardCharsets.UTF_8);}catch(Exception e){showError("报告导出失败",e);}});
-            }
-        }
-        private void scopeDiff(){
-            if(disposed)return;
-            int row=scopeTable.getSelectedRow();if(row<0)return;
-            WorkspaceScope.File file=scopeModel.rows.get(scopeTable.convertRowIndexToModel(row));
-            WorkspaceScope.Repository repository=view.scope().repositories().stream().filter(r->r.root().equals(file.root())).findFirst().orElse(null);if(repository==null)return;
-            ApplicationManager.getApplication().executeOnPooledThread(()->{
-                try{
-                    if(disposed||project.isDisposed())return;
-                    GitRepository.ChangedFile change=service.scopeFile(file.root(),repository.head(),file.path());
-                    ApplicationManager.getApplication().invokeLater(()->{
-                        if(disposed||project.isDisposed())return;
-                        var factory=DiffContentFactory.getInstance();
-                        DiffManager.getInstance().showDiff(project,new SimpleDiffRequest(rootName(file.root())+" / "+file.path()+"（审查提交快照，不含当前编辑）",factory.create(project,change.before(),PlainTextFileType.INSTANCE),factory.create(project,change.after(),PlainTextFileType.INSTANCE),"基线快照 "+shortRevision(repository.baseline())+" / "+change.beforePath(),"目标快照 "+shortRevision(repository.head())+" / "+change.path()));
-                    });
-                }catch(Exception e){showError("无法打开范围 Diff",e);}
-            });
-        }
         private void locate(int index){
             if(disposed)return;
             Review.Report r=history.getSelectedValue();if(r==null||index<0||index>=r.result().findings().size())return;

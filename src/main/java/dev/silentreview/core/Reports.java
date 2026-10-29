@@ -1,5 +1,6 @@
 package dev.silentreview.core;
 
+import com.google.gson.*;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
@@ -8,7 +9,17 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class Reports {
-    public enum Decision { UNREVIEWED, CONFIRMED, ACCEPTED, CLOSED }
+    public enum Decision { PENDING, CONFIRMED }
+    /** Reads both the two current states and the four states written by earlier plugin versions. */
+    private static final Gson RESOLUTION_JSON=new GsonBuilder().registerTypeAdapter(Decision.class,
+        (JsonDeserializer<Decision>)(json,type,context)->{
+            String value=json.getAsString();
+            return switch(value) {
+                case "PENDING","UNREVIEWED" -> Decision.PENDING;
+                case "CONFIRMED","ACCEPTED","CLOSED" -> Decision.CONFIRMED;
+                default -> throw new JsonParseException("未知报告处理状态："+value);
+            };
+        }).create();
     public record AuditEvent(Decision decision,String at,String actor,String note) {}
     public record Resolution(String reportId,Decision decision,String updatedAt,String actor,String note,List<AuditEvent> history) {
         public Resolution { history=history==null?List.of():List.copyOf(history); }
@@ -71,12 +82,12 @@ public final class Reports {
         }
     }
     public static Resolution resolution(String reportId,Map<String,Resolution> resolutions) {
-        return resolutions.getOrDefault(reportId,new Resolution(reportId,Decision.UNREVIEWED,"","","",List.of()));
+        return resolutions.getOrDefault(reportId,new Resolution(reportId,Decision.PENDING,"","","",List.of()));
     }
     private Map<String,Resolution> readResolutionsLocked() throws IOException {
         Path file=directory.resolve(RESOLUTIONS);if(!Files.exists(file))return new LinkedHashMap<>();
         try {
-            ResolutionFile saved=Review.JSON.fromJson(Files.readString(file,StandardCharsets.UTF_8),ResolutionFile.class);
+            ResolutionFile saved=RESOLUTION_JSON.fromJson(Files.readString(file,StandardCharsets.UTF_8),ResolutionFile.class);
             if(saved==null||saved.schemaVersion()!=1||saved.resolutions()==null)throw new IllegalArgumentException();
             Map<String,Resolution> result=new LinkedHashMap<>();
             for(var entry:saved.resolutions().entrySet()) {
@@ -94,7 +105,7 @@ public final class Reports {
         } catch(RuntimeException e) {throw new IOException("报告处理记录损坏，已保留原文件，未覆盖历史",e);}
     }
     private void writeResolutionsLocked(Map<String,Resolution> resolutions) throws IOException {
-        writeAtomically(directory.resolve(RESOLUTIONS),Review.JSON.toJson(new ResolutionFile(1,resolutions)));
+        writeAtomically(directory.resolve(RESOLUTIONS),RESOLUTION_JSON.toJson(new ResolutionFile(1,resolutions)));
     }
     private void writeAtomically(Path target,String text) throws IOException {
         Files.createDirectories(directory);Path temp=Files.createTempFile(directory,"report-",".tmp");
@@ -131,7 +142,7 @@ public final class Reports {
             .append("\n- 模型：").append(report.model()).append("\n- 执行状态：").append(label(report.result().status())).append("\n\n");
         out.append("## 人工处理\n\n- 处理状态：").append(label(resolution.decision())).append('\n');
         if(!resolution.updatedAt().isBlank())out.append("- 更新时间：").append(resolution.updatedAt()).append("\n- 操作者：").append(resolution.actor()).append("\n- 备注：").append(resolution.note()).append('\n');
-        out.append("\n人工确认、采纳或关闭仅记录处理进度，不改变 AI 执行状态、检查覆盖或未完成项；采纳不会自动修改代码。\n\n");
+        out.append("\n人工处理仅记录待处理或已确认的进度，不改变 AI 执行状态、检查覆盖或未完成项。\n\n");
         if(!resolution.history().isEmpty()) {
             out.append("| 时间 | 处理 | 操作者 | 备注 |\n| --- | --- | --- | --- |\n");
             for(AuditEvent event:resolution.history())out.append("| ").append(cell(event.at())).append(" | ").append(label(event.decision())).append(" | ").append(cell(event.actor())).append(" | ").append(cell(event.note())).append(" |\n");
@@ -160,7 +171,7 @@ public final class Reports {
     }
     private static String cell(String value){return value.replace("|","\\|").replace("\r","").replace("\n","<br>");}
     public static String label(Decision decision) {
-        return switch(decision) {case UNREVIEWED->"待处理";case CONFIRMED->"已确认";case ACCEPTED->"已采纳";case CLOSED->"已关闭";};
+        return switch(decision) {case PENDING->"待处理";case CONFIRMED->"已确认";};
     }
     public static String label(Review.Status status) {
         return switch(status) {

@@ -3,11 +3,12 @@ package dev.silentreview.idea;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.application.ModalityState;
 import com.intellij.openapi.application.ReadAction;
-import com.intellij.openapi.fileEditor.FileEditorManager;
+import com.intellij.openapi.fileChooser.FileChooser;
+import com.intellij.openapi.fileChooser.FileChooserDescriptor;
+import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory;
 import com.intellij.openapi.options.*;
 import com.intellij.openapi.progress.*;
 import com.intellij.openapi.project.Project;
-import com.intellij.openapi.vfs.LocalFileSystem;
 import com.intellij.openapi.vfs.VirtualFile;
 import dev.silentreview.core.AiClient;
 import dev.silentreview.core.Rules;
@@ -16,9 +17,11 @@ import javax.swing.*;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import java.awt.*;
+import java.io.IOException;
 import java.nio.CharBuffer;
 import java.nio.file.*;
 import java.util.Arrays;
+import java.util.Locale;
 
 public final class ReviewConfigurable implements Configurable {
     private final Project project;
@@ -35,12 +38,14 @@ public final class ReviewConfigurable implements Configurable {
         panel=new JPanel(new GridBagLayout()); GridBagConstraints c=new GridBagConstraints();
         c.insets=new Insets(7,8,7,8); c.fill=GridBagConstraints.HORIZONTAL; c.anchor=GridBagConstraints.NORTHWEST;
         path=new JTextField(40); endpoint=new JTextField(40); model=new JTextField(40); key=new JPasswordField(40);
-        add(c,0,"规则集路径",path);
+        JPanel pathRow=new JPanel(new BorderLayout(6,0));pathRow.add(path,BorderLayout.CENTER);
+        JButton browse=new JButton("浏览…");browse.addActionListener(e->chooseRulesFile());pathRow.add(browse,BorderLayout.EAST);
+        add(c,0,"规则集路径",pathRow);
         JPanel ruleButtons=new JPanel(new FlowLayout(FlowLayout.LEFT,0,0));
-        JButton create=new JButton("创建示例规则"),validate=new JButton("检查规则文件"),open=new JButton("打开规则文件");
+        JButton create=new JButton("创建示例规则"),validate=new JButton("检查规则文件"),open=new JButton("打开所在文件夹");
         ruleButtons.add(create);ruleButtons.add(Box.createHorizontalStrut(8));ruleButtons.add(validate);
         ruleButtons.add(Box.createHorizontalStrut(8));ruleButtons.add(open);span(c,1,ruleButtons);
-        ruleStatus=note("相对路径从当前项目根目录解析；已有文件不会被覆盖。");span(c,2,ruleStatus);
+        ruleStatus=note("相对路径优先从各仓库根目录解析，找不到时回退到项目根目录；已有文件不会被覆盖。");span(c,2,ruleStatus);
         add(c,3,"AI 接口地址",endpoint);add(c,4,"模型",model);add(c,5,"API Key",key);
         keyStatus=note("正在查询当前接口的凭据状态…");span(c,6,keyStatus);
         span(c,7,note("Key 留空保留原凭据。保存成功后输入框会清空，状态确认已保存；不会显示明文。"));
@@ -81,18 +86,38 @@ public final class ReviewConfigurable implements Configurable {
         c.gridy=row;c.gridx=0;c.gridwidth=1;c.weightx=0;panel.add(new JLabel(label),c);
         c.gridx=1;c.weightx=1;panel.add(field,c);
     }
+    private void chooseRulesFile(){
+        FileChooserDescriptor descriptor=FileChooserDescriptorFactory.createSingleFileDescriptor("json");
+        descriptor.setTitle("选择规则集文件");
+        descriptor.setDescription("选择包含审查规则定义的 JSON 文件");
+        VirtualFile chosen=FileChooser.chooseFile(descriptor,project,null);
+        if(chosen==null)return;
+        Path selected=Path.of(chosen.getPath()).toAbsolutePath().normalize();
+        path.setText(relativeToProject(selected));
+        setNote(ruleStatus,"已选择规则集文件："+selected);
+    }
+    private String relativeToProject(Path selected){
+        try{
+            String base=project.getBasePath();
+            if(base!=null&&!base.isBlank()){
+                Path root=Path.of(base).toAbsolutePath().normalize();
+                if(selected.startsWith(root))return root.relativize(selected).toString().replace('\\','/');
+            }
+        }catch(RuntimeException ignored){}
+        return selected.toString();
+    }
     private void rulesAction(JButton button,boolean create,boolean open){
         JPanel shown=panel;String configured=path.getText();
         ModalityState modality=ModalityState.current();
         button.setEnabled(false);setNote(ruleStatus,create?"正在创建示例规则…":"正在读取规则文件…");
         ApplicationManager.getApplication().executeOnPooledThread(()->{
-            String message;VirtualFile resolvedFile=null;
+            String message;
             try {
                 Path resolved=RuleTemplate.resolve(ReadAction.compute(project::getBasePath),configured);
                 if(open){
                     if(!Files.isRegularFile(resolved))throw new IllegalArgumentException("规则文件不存在："+resolved);
-                    resolvedFile=LocalFileSystem.getInstance().refreshAndFindFileByNioFile(resolved);
-                    message="已打开规则文件："+resolved;
+                    openInFileManager(resolved);
+                    message="已在文件管理器中打开："+resolved.getParent();
                 }else{
                     RuleTemplate.Created created=create?RuleTemplate.create(resolved):null;
                     Rules.Snapshot rules=Rules.load(resolved);
@@ -100,13 +125,28 @@ public final class ReviewConfigurable implements Configurable {
                         " · "+rules.name()+" · "+rules.rules().size()+" 条 · "+resolved;
                 }
             }catch(Exception failure){message=failure.getMessage()==null?"读取规则失败，请检查文件路径和 JSON 格式。":failure.getMessage();}
-            String result=message;VirtualFile file=resolvedFile;
+            String result=message;
             ApplicationManager.getApplication().invokeLater(()->{
                 if(panel!=shown||project.isDisposed())return;
                 setNote(ruleStatus,result);button.setEnabled(true);
-                if(file!=null&&file.isValid())FileEditorManager.getInstance(project).openFile(file,true);
             },modality);
         });
+    }
+    private static void openInFileManager(Path file) throws IOException {
+        Path directory=file.toAbsolutePath().normalize().getParent();
+        if(directory==null||!Files.isDirectory(directory))throw new IOException("找不到规则文件所在目录："+file);
+        try{
+            if(Desktop.isDesktopSupported()){
+                Desktop desktop=Desktop.getDesktop();
+                if(desktop.isSupported(Desktop.Action.OPEN)){desktop.open(directory.toFile());return;}
+            }
+        }catch(IOException|RuntimeException ignored){}
+        String os=System.getProperty("os.name","").toLowerCase(Locale.ROOT);
+        ProcessBuilder builder;
+        if(os.contains("win"))builder=new ProcessBuilder("explorer.exe",directory.toString());
+        else if(os.contains("mac"))builder=new ProcessBuilder("open",directory.toString());
+        else builder=new ProcessBuilder("xdg-open",directory.toString());
+        builder.start();
     }
     private void scheduleCredentialStatus(){
         statusRequests.next();if(panel==null)return;

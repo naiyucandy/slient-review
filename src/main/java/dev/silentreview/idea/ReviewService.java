@@ -51,7 +51,6 @@ public final class ReviewService implements Disposable {
     public static ReviewService get(Project project){return project.getService(ReviewService.class);}
     public View view(){return new View(status,message,List.copyOf(history),Map.copyOf(resolutions),prepared.state(),busy,preparedDiscoveryNotes,preparedDiscoveryLimitations);}
     public int latestBatchFindingCount(){return latestBatchFindings;}
-    public GitRepository.ChangedFile scopeFile(String root,String head,String path){return prepared.file(root,head,path);}
     public void listen(Consumer<View> listener,Disposable parent) {
         listeners.add(listener);Disposer.register(parent,()->listeners.remove(listener));listener.accept(view());
     }
@@ -129,10 +128,21 @@ public final class ReviewService implements Disposable {
     public void setIncluded(String root,String path,boolean included){
         synchronized(scopeLock){if(busy)return;prepared=prepared.include(root,path,included);}publish();
     }
-    public void setAllIncluded(boolean included){
-        synchronized(scopeLock){if(busy)return;prepared=prepared.includeAll(included);}publish();
+    public void setAllIncluded(boolean included,Set<String> roots){
+        Set<String> selected=roots==null?Set.of():Set.copyOf(roots);
+        synchronized(scopeLock){
+            if(busy)return;
+            WorkspaceScope.Prepared next=prepared;
+            for(var repository:next.state().repositories()){
+                if(!selected.contains(repository.root()))continue;
+                for(var file:repository.files())next=next.include(repository.root(),file.path(),included);
+            }
+            prepared=next;
+        }
+        publish();
     }
-    public void startPreparedReview(){
+    public void startPreparedReview(Set<String> roots){
+        Set<String> selectedRoots=roots==null?Set.of():Set.copyOf(roots);
         final WorkspaceScope.Prepared selected;final AtomicBoolean canceled;
         synchronized(scopeLock){
             if(busy||disposed)return;
@@ -147,17 +157,23 @@ public final class ReviewService implements Disposable {
             synchronized(scopeLock){prepared=new WorkspaceScope.Prepared(selected.state().markStale(),selected.frozen());}
             update(Review.Status.FAILED,"规则路径已变化，请重新准备审查范围。");finish();return;
         }
+        List<WorkspaceScope.Task> tasks=selected.tasks().stream()
+            .filter(task->selectedRoots.contains(task.changes().root())).toList();
+        if(tasks.isEmpty()){
+            update(Review.Status.NOT_APPLICABLE,"所选仓库没有已纳入的可审查文件，请选择仓库或纳入文件。");finish();return;
+        }
         activeEndpoint=settings.endpoint();
         update(Review.Status.PREPARING,"核对冻结的仓库快照并开始审查…");
         queue.submit(()->{
             try{
-                List<WorkspaceScope.Task> tasks=selected.tasks();
                 try{WorkspaceScope.validateCurrent(tasks,()->disposed||canceled.get());}
                 catch(java.io.IOException changed){
                     synchronized(scopeLock){prepared=new WorkspaceScope.Prepared(selected.state().markStale(),selected.frozen());}
                     throw changed;
                 }
-                List<String> errors=selected.state().repositories().stream().filter(r->r.error()!=null&&!r.error().isBlank())
+                List<String> errors=selected.state().repositories().stream()
+                    .filter(r->selectedRoots.contains(r.root()))
+                    .filter(r->r.error()!=null&&!r.error().isBlank())
                     .map(r->r.root()+"："+r.error()).toList();
                 runBatch(withDiscoveryContext(tasks),settings,false,errors,canceled,preparedDiscoveryLimitations);
             }catch(CancellationException e){update(Review.Status.CANCELED,"检查已取消，不能作为已完成结果。");}
