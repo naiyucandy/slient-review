@@ -45,14 +45,24 @@ public final class WorkspaceScope {
             return new Prepared(new State(state.baseline(),repos,state.preparing(),state.stale()),frozen);
         }
         public Prepared includeAll(boolean included){
+            return includeAll(included,null);
+        }
+        /** null keeps the legacy all-repository behavior; an empty selection changes no files. */
+        public Prepared includeAll(boolean included,Set<String> roots){
+            Set<String> selected=roots==null?null:Set.copyOf(roots);
             List<Repository> repos=state.repositories().stream().map(r->new Repository(r.root(),r.branch(),r.head(),r.baseline(),r.description(),
-                r.files().stream().map(f->f.include(included)).toList(),r.error())).toList();
+                r.files().stream().map(f->selected==null||selected.contains(r.root())?f.include(included):f).toList(),r.error())).toList();
             return new Prepared(new State(state.baseline(),repos,state.preparing(),state.stale()),frozen);
         }
         /** Only selected, rule-matched files enter AI payloads AND the persisted report reference. */
         public List<Task> tasks(){
+            return tasks(null);
+        }
+        public List<Task> tasks(Set<String> roots){
+            Set<String> selected=roots==null?null:Set.copyOf(roots);
             List<Task> result=new ArrayList<>();
             for(FrozenRepository repository:frozen){
+                if(selected!=null&&!selected.contains(repository.changes().root()))continue;
                 Set<String> paths=new HashSet<>();
                 state.repositories().stream().filter(r->r.root().equals(repository.changes().root())).flatMap(r->r.files().stream())
                     .filter(f->f.included()&&f.selectable()).forEach(f->paths.add(f.path()));
@@ -66,6 +76,12 @@ public final class WorkspaceScope {
                 result.add(new Task(repository.rules(),new GitRepository.ChangeSet(c.root(),c.branch(),c.base(),c.target(),files,c.limitations()),description));
             }
             return List.copyOf(result);
+        }
+        public List<String> preparationErrors(Set<String> roots){
+            Set<String> selected=roots==null?null:Set.copyOf(roots);
+            return state.repositories().stream().filter(repository->selected==null||selected.contains(repository.root()))
+                .filter(repository->repository.error()!=null&&!repository.error().isBlank())
+                .map(repository->repository.root()+"："+repository.error()).toList();
         }
     }
 

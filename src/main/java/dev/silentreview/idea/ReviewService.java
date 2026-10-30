@@ -17,7 +17,8 @@ import javax.swing.SwingUtilities;
 
 public final class ReviewService implements Disposable {
     public record View(Review.Status status,String message,List<Review.Report> reports,
-                       Map<String,Reports.Resolution> resolutions,WorkspaceScope.State scope,boolean busy,
+                       Map<String,Reports.Resolution> resolutions,Map<String,Map<Integer,Reports.FindingResolution>> findingResolutions,
+                       WorkspaceScope.State scope,boolean busy,
                        List<String> discoveryNotes,List<String> discoveryLimitations) {}
     private record Config(String rulesPath,String endpoint,String model,boolean consent) {}
     private final Project project;
@@ -25,6 +26,7 @@ public final class ReviewService implements Disposable {
     private final List<Consumer<View>> listeners=new CopyOnWriteArrayList<>();
     private final List<Review.Report> history=new CopyOnWriteArrayList<>();
     private final Map<String,Reports.Resolution> resolutions=new ConcurrentHashMap<>();
+    private volatile Map<String,Map<Integer,Reports.FindingResolution>> findingResolutions=Map.of();
     private final Set<String> automaticKeys=ConcurrentHashMap.newKeySet();
     private final Object scopeLock=new Object();
     private final Reports store;
@@ -45,12 +47,14 @@ public final class ReviewService implements Disposable {
         queue.submit(()->{
             try{history.addAll(store.load());}catch(Exception e){message="历史报告读取失败："+safeMessage(e);}
             try{resolutions.putAll(store.loadResolutions());}catch(Exception e){message="报告确认历史读取失败："+safeMessage(e);}
+            try{findingResolutions=store.loadFindingResolutions();}catch(Exception e){message="逐问题确认历史读取失败："+safeMessage(e);}
             publish();
         });
     }
     public static ReviewService get(Project project){return project.getService(ReviewService.class);}
-    public View view(){return new View(status,message,List.copyOf(history),Map.copyOf(resolutions),prepared.state(),busy,preparedDiscoveryNotes,preparedDiscoveryLimitations);}
+    public View view(){return new View(status,message,List.copyOf(history),Map.copyOf(resolutions),findingResolutions,prepared.state(),busy,preparedDiscoveryNotes,preparedDiscoveryLimitations);}
     public int latestBatchFindingCount(){return latestBatchFindings;}
+    public GitRepository.ChangedFile scopeFile(String root,String head,String path){return prepared.file(root,head,path);}
     public void listen(Consumer<View> listener,Disposable parent) {
         listeners.add(listener);Disposer.register(parent,()->listeners.remove(listener));listener.accept(view());
     }
@@ -128,24 +132,26 @@ public final class ReviewService implements Disposable {
     public void setIncluded(String root,String path,boolean included){
         synchronized(scopeLock){if(busy)return;prepared=prepared.include(root,path,included);}publish();
     }
+    public void setAllIncluded(boolean included){
+        synchronized(scopeLock){if(busy)return;prepared=prepared.includeAll(included);}publish();
+    }
     public void setAllIncluded(boolean included,Set<String> roots){
         Set<String> selected=roots==null?Set.of():Set.copyOf(roots);
-        synchronized(scopeLock){
-            if(busy)return;
-            WorkspaceScope.Prepared next=prepared;
-            for(var repository:next.state().repositories()){
-                if(!selected.contains(repository.root()))continue;
-                for(var file:repository.files())next=next.include(repository.root(),file.path(),included);
-            }
-            prepared=next;
-        }
-        publish();
+        synchronized(scopeLock){if(busy)return;prepared=prepared.includeAll(included,selected);}publish();
+    }
+    public void startPreparedReview(){
+        startPreparedReviewInternal(null);
     }
     public void startPreparedReview(Set<String> roots){
-        Set<String> selectedRoots=roots==null?Set.of():Set.copyOf(roots);
+        startPreparedReviewInternal(roots==null?Set.of():Set.copyOf(roots));
+    }
+    private void startPreparedReviewInternal(Set<String> roots){
         final WorkspaceScope.Prepared selected;final AtomicBoolean canceled;
         synchronized(scopeLock){
             if(busy||disposed)return;
+            if(roots!=null&&roots.isEmpty()){
+                update(Review.Status.NOT_APPLICABLE,"请先选择要审查的仓库。");return;
+            }
             selected=prepared;
             if(!selected.state().ready()){
                 update(Review.Status.NOT_APPLICABLE,selected.state().stale()?"范围已失效，请重新准备范围。":"请先准备范围并至少纳入一个匹配规则的文件。");return;
@@ -157,24 +163,20 @@ public final class ReviewService implements Disposable {
             synchronized(scopeLock){prepared=new WorkspaceScope.Prepared(selected.state().markStale(),selected.frozen());}
             update(Review.Status.FAILED,"规则路径已变化，请重新准备审查范围。");finish();return;
         }
-        List<WorkspaceScope.Task> tasks=selected.tasks().stream()
-            .filter(task->selectedRoots.contains(task.changes().root())).toList();
-        if(tasks.isEmpty()){
-            update(Review.Status.NOT_APPLICABLE,"所选仓库没有已纳入的可审查文件，请选择仓库或纳入文件。");finish();return;
-        }
         activeEndpoint=settings.endpoint();
         update(Review.Status.PREPARING,"核对冻结的仓库快照并开始审查…");
         queue.submit(()->{
             try{
+                List<WorkspaceScope.Task> tasks=selected.tasks(roots);
+                if(tasks.isEmpty()){
+                    update(Review.Status.NOT_APPLICABLE,"所选仓库没有已纳入且匹配规则的文件，请选择仓库并纳入文件。");return;
+                }
                 try{WorkspaceScope.validateCurrent(tasks,()->disposed||canceled.get());}
                 catch(java.io.IOException changed){
                     synchronized(scopeLock){prepared=new WorkspaceScope.Prepared(selected.state().markStale(),selected.frozen());}
                     throw changed;
                 }
-                List<String> errors=selected.state().repositories().stream()
-                    .filter(r->selectedRoots.contains(r.root()))
-                    .filter(r->r.error()!=null&&!r.error().isBlank())
-                    .map(r->r.root()+"："+r.error()).toList();
+                List<String> errors=selected.preparationErrors(roots);
                 runBatch(withDiscoveryContext(tasks),settings,false,errors,canceled,preparedDiscoveryLimitations);
             }catch(CancellationException e){update(Review.Status.CANCELED,"检查已取消，不能作为已完成结果。");}
             catch(Exception e){update(Review.Status.FAILED,safeMessage(e));}
@@ -294,14 +296,30 @@ public final class ReviewService implements Disposable {
         }
     }
     private void save(Review.Report report)throws java.io.IOException{
-        store.save(report);history.add(0,report);while(history.size()>100)history.remove(history.size()-1);publish();
+        store.save(report);history.add(0,report);while(history.size()>100)history.remove(history.size()-1);reloadHandling();publish();
+    }
+    private void reloadHandling()throws java.io.IOException{
+        Map<String,Reports.Resolution> saved=store.loadResolutions();
+        Map<String,Map<Integer,Reports.FindingResolution>> findings=store.loadFindingResolutions();
+        resolutions.clear();resolutions.putAll(saved);findingResolutions=findings;
+    }
+    public CompletableFuture<Reports.FindingResolution> acknowledgeFinding(String reportId,int findingIndex,boolean confirmed){
+        CompletableFuture<Reports.FindingResolution> completion=new CompletableFuture<>();
+        try{queue.submit(()->{
+            try{
+                Reports.FindingResolution saved=store.acknowledgeFinding(reportId,findingIndex,confirmed,
+                    confirmed?"用户确认此问题已解决。":"用户撤销此问题的已解决确认。",System.getProperty("user.name","IDE 用户"));
+                reloadHandling();publish();completion.complete(saved);
+            }catch(Exception failure){update(Review.Status.FAILED,"问题确认保存失败："+safeMessage(failure));completion.completeExceptionally(failure);}
+        });}catch(RejectedExecutionException closed){completion.completeExceptionally(closed);}
+        return completion;
     }
     public void acknowledge(String reportId,Reports.Decision decision,String note){
         queue.submit(()->{try{Reports.Resolution resolution=store.acknowledge(reportId,decision,note,System.getProperty("user.name","IDE 用户"));resolutions.put(reportId,resolution);publish();}
             catch(Exception e){update(Review.Status.FAILED,"报告确认保存失败："+safeMessage(e));}});
     }
     public void cancel(){AtomicBoolean active=cancellation;if(active!=null)active.set(true);}
-    public void clearHistory(){queue.submit(()->{try{store.clear();history.clear();resolutions.clear();publish();}catch(Exception e){update(Review.Status.FAILED,safeMessage(e));}});}
+    public void clearHistory(){queue.submit(()->{try{store.clear();history.clear();resolutions.clear();findingResolutions=Map.of();publish();}catch(Exception e){update(Review.Status.FAILED,safeMessage(e));}});}
     private static String safeMessage(Exception e){return e.getMessage()==null?"检查失败，请重试。":e.getMessage();}
     @Override public void dispose(){disposed=true;cancel();queue.shutdownNow();listeners.clear();if(fish!=null)fish.dispose();}
 }

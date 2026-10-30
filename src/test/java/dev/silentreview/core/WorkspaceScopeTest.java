@@ -131,7 +131,7 @@ class WorkspaceScopeTest {
         assertTrue(file.before().isEmpty());assertEquals("class OrderService {}\n",file.after());
         assertTrue(file.diff().contains("new file mode"));assertEquals(1,prepared.tasks().size());
     }
-    @Test void frozenScopeFileRemainsThePreparedSelectionAfterHeadAndWorkingTreeChange()throws Exception{
+    @Test void scopeDiffRemainsTheFrozenSelectionAfterHeadAndWorkingTreeChange()throws Exception{
         sharedRules();Path root=repository("latin");var prepared=collect(List.of(root));var repo=prepared.state().repositories().get(0);
         var frozen=prepared.file(repo.root(),repo.head(),"src/OrderService.java");
         write(root,"src/OrderService.java","committed later\n");git(root,"add",".");git(root,"commit","-m","later");
@@ -148,5 +148,37 @@ class WorkspaceScopeTest {
         var current=refreshed.state().repositories().get(0);
         assertThrows(IllegalArgumentException.class,()->refreshed.file("wrong-root",current.head(),"src/OrderService.java"));
         assertThrows(IllegalArgumentException.class,()->refreshed.file(current.root(),current.head(),"missing.java"));
+    }
+    @Test void bulkInclusionChangesOnlySelectedRepositoriesAndRetainsLegacyAllBehavior()throws Exception{
+        sharedRules();Path first=repository("cable"),second=repository("latin");var prepared=collect(List.of(first,second));
+        var onlyFirst=prepared.includeAll(false).includeAll(true,Set.of(first.toString()));
+        assertEquals(1,onlyFirst.state().includedCount());assertEquals(1,onlyFirst.tasks().size());
+        assertEquals(first.toString(),onlyFirst.tasks().get(0).changes().root());
+        assertEquals(onlyFirst,onlyFirst.includeAll(false,Set.of()),"Empty selection must not alter hidden repositories");
+        assertTrue(onlyFirst.includeAll(false,Set.of(first.toString())).tasks().isEmpty());
+        assertEquals(2,onlyFirst.includeAll(true).tasks().size());assertEquals(2,prepared.state().includedCount());
+    }
+    @Test void repositorySelectionLimitsActualAiPayloadAndReportNotJustVisibleRows()throws Exception{
+        sharedRules();Path first=repository("cable"),second=repository("latin");var prepared=collect(List.of(first,second));
+        var tasks=prepared.tasks(Set.of(second.toString()));assertEquals(1,tasks.size());assertTrue(prepared.tasks(Set.of()).isEmpty());
+        List<Review.Request> sent=new ArrayList<>();var task=tasks.get(0);
+        var outcome=new ReviewRunner().run(task.rules(),task.changes(),request->{
+            sent.add(request);JsonObject response=new JsonObject();response.add("findings",new JsonArray());
+            response.add("coverage",Review.JSON.toJsonTree(request.requiredChecks().stream().map(check->new Review.Coverage(check.filePath(),check.ruleId(),"reviewed","")).toList()));
+            response.add("limitations",new JsonArray());return new AiClient.Response(response.toString(),"test",null);
+        },()->false,ignored->{});
+        assertEquals(1,sent.size());assertEquals(second.toString(),sent.get(0).changes().root());
+        var report=Review.report(outcome.reference(),task.description(),outcome.model(),null,outcome.result());assertEquals(second.toString(),report.root());
+        assertEquals(2,prepared.tasks().size(),"Preparing a subset must leave the immutable full snapshot intact");
+        git(first,"checkout","-b","unselected-branch");WorkspaceScope.validateCurrent(tasks,()->false);
+        assertThrows(IOException.class,()->WorkspaceScope.validateCurrent(prepared.tasks(),()->false));
+    }
+    @Test void unselectedPreparationErrorsDoNotEnterSelectedBatch()throws Exception{
+        sharedRules();Path first=repository("latin"),broken=Files.createDirectory(workspace.resolve("broken"));var prepared=collect(List.of(first,broken));
+        assertEquals(1,prepared.preparationErrors(null).size());
+        assertTrue(prepared.preparationErrors(Set.of(first.toString())).isEmpty());assertTrue(prepared.preparationErrors(Set.of()).isEmpty());
+        assertEquals(1,prepared.preparationErrors(Set.of(broken.toString())).size());
+        assertTrue(prepared.preparationErrors(Set.of(broken.toString())).get(0).contains(broken.toString()));
+        assertEquals(1,prepared.tasks(Set.of(first.toString())).size());assertTrue(prepared.tasks(Set.of(broken.toString())).isEmpty());
     }
 }

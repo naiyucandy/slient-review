@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.LinkOption;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -16,6 +17,8 @@ public final class FindingNavigation {
     public enum Match { ORIGINAL, MOVED, APPROXIMATE }
     public record Target(Path path,boolean renamedFallback) {}
     public record Line(int zeroBasedLine,Match match,String message) {}
+    /** End offsets exclude the last line separator; line numbers are zero based and inclusive. */
+    public record Selection(int zeroBasedStartLine,int zeroBasedEndLine,int startOffset,int endOffset) {}
 
     /** Also accepts unregistered Git roots discovered inside a project content directory after restart. */
     public static boolean inProject(Path reportRoot,Collection<Path> registeredRoots,Collection<Path> projectDirectories)throws IOException{
@@ -72,7 +75,7 @@ public final class FindingNavigation {
     /** Receives the IDE's current Document text, including unsaved edits and its decoded charset. */
     public static Line currentLine(String document,String evidence,int reportStartLine){
         List<String> current=lines(document==null?"":document);
-        int original=Math.max(0,Math.min(reportStartLine-1,current.size()-1));
+        int original=(int)Math.max(0,Math.min((long)reportStartLine-1,current.size()-1));
         List<String> expected=lines(evidence==null?"":evidence.strip());
         if(evidence==null||evidence.isBlank())return new Line(original,Match.APPROXIMATE,"报告没有可核对的代码证据，已打开原报告行号附近，仅作定位参考。");
         if(reportStartLine>=1&&matches(current,reportStartLine-1,expected))return new Line(reportStartLine-1,Match.ORIGINAL,"");
@@ -81,8 +84,24 @@ public final class FindingNavigation {
         if(count==1)return new Line(found,Match.MOVED,"代码行号已变化，已根据当前文档中唯一的报告证据定位到第 "+(found+1)+" 行。");
         return new Line(original,Match.APPROXIMATE,(count>1?"当前源码有多处相同证据，无法唯一定位。":"当前源码的报告证据已修改或删除。")+"已打开原报告行号附近第 "+(original+1)+" 行，仅作定位参考。");
     }
+    /** Only a verified location can retain the report's multiline span; stale locations select one line. */
+    public static Selection selection(String document,Line location,String evidence,int reportStartLine,int reportEndLine){
+        String text=document==null?"":document;
+        List<Integer> starts=new ArrayList<>(),ends=new ArrayList<>();starts.add(0);
+        for(int i=0;i<text.length();i++)if(text.charAt(i)=='\n'||text.charAt(i)=='\r'){
+            ends.add(i);
+            if(text.charAt(i)=='\r'&&i+1<text.length()&&text.charAt(i+1)=='\n')i++;
+            starts.add(i+1);
+        }
+        ends.add(text.length());
+        int start=Math.max(0,Math.min(location.zeroBasedLine(),starts.size()-1));
+        long reportSpan=Math.max(1,(long)reportEndLine-reportStartLine+1);
+        long span=location.match()==Match.APPROXIMATE?1:Math.min(reportSpan,lines(evidence==null?"":evidence.strip()).size());
+        int end=(int)Math.min(starts.size()-1,(long)start+span-1);
+        return new Selection(start,end,starts.get(start),ends.get(end));
+    }
     private static boolean matches(List<String> current,int start,List<String> expected){
-        if(start<0||start+expected.size()>current.size())return false;
+        if(start<0||start>current.size()-expected.size())return false;
         return String.join("\n",current.subList(start,start+expected.size())).strip().equals(String.join("\n",expected).strip());
     }
     private static List<String> lines(String value){return List.of(value.replace("\r\n","\n").replace('\r','\n').split("\n",-1));}

@@ -6,10 +6,10 @@ IDEA 内的静默提交代码审查插件。按已有规则审查 Git 提交，�
 
 ## 功能
 
-- 多 Git 根项目：逐仓库准备范围，支持按仓库多选/全选规划本次审查；单个仓库失败不阻断其他仓库。
+- 多 Git 根项目：自动识别当前项目结构下的全部仓库并逐仓库准备范围；单个仓库失败不阻断其他仓库。
 - 文件级纳入/排除与冻结提交，报告保留仓库、提交和审查范围。
 - 通用关联上下文：按规则引用或 `contextFiles` 声明读取同一提交中的配套文件，不固化业务规则。
-- 报告仅保留待处理/已确认两种人工处理状态及操作历史；问题默认跳转项目真实源码。
+- 任务→问题多级目录，父节点单页完整报告，子节点仅含规则、问题代码和问题描述；点击代码定位项目源码，支持逐问题Approve/撤销。旧报告与审计历史保留。
 - API Key 安全存储与配置状态提示，可主动创建可编辑的默认规则模板；规则集文件支持浏览选择，并可在系统文件管理器中打开。
 - 小人点击切换面板显隐，支持四边吸附，五组像素动画共用呼吸节奏；显隐开关只在设置中配置。
 
@@ -17,12 +17,12 @@ IDEA 内的静默提交代码审查插件。按已有规则审查 Git 提交，�
 
 源码仓库不包含插件安装 ZIP。安装包通过 [Releases](https://github.com/naiyucandy/slient-review/releases) 单独发布；尚未发布时可按下方步骤自行构建。
 
-当前版本为 **1.1.1**，安装范围从 **IDEA 2024.1（241）起**，不再限制到 2024.3。新旧 IDE 共用 `silent-review-1.1.1.zip`。在 IDEA 的 **设置 → Plugins → 齿轮 → Install Plugin from Disk** 中选择插件 ZIP，按提示重启。
+当前版本为 **1.1.5**，安装范围从 **IDEA 2024.1（241）起**，不再限制到 2024.3。新旧 IDE 共用 `silent-review-1.1.5.zip`。在 IDEA 的 **设置 → Plugins → 齿轮 → Install Plugin from Disk** 中选择插件 ZIP，按提示重启。
 
 1. 打开包含一个或多个 Git 根的项目。
 2. 在 **设置 → 静默代码检测** 创建或浏览选择规则并检查，填写 AI 接口、模型和 API Key，确认发送授权后应用。
-3. 在 **Silent Review → 审查范围** 准备当前提交，选择要审查的仓库、确认纳入文件后开始审查。
-4. 在 **报告与处理** 查看结果、打开项目源码，并用 **处理/不处理** 记录人工状态。
+3. 在 **Silent Review → 审查范围** 准备当前提交，自动覆盖当前项目识别到的全部仓库；确认纳入文件后开始审查。
+4. 在 **报告与处理** 选择父节点阅读一页完整报告，选择子问题查看规则、可点击代码和描述；用右下角Approve确认/撤销。取消重复的处理按钮与仓库选择器。
 
 审查对象是已提交快照。未提交的代码不会被悄悄混入，IDEA 提交窗口的 included 选择也不会被插件修改。
 
@@ -47,7 +47,7 @@ bash gradlew test buildPlugin verifyPluginStructure
 默认编译 SDK 固定为 IDEA Community 2024.1，输出 Java 17 字节码，避免使用新版 API 后让旧版无法运行。可用本机 IDEA 自带的 JDK 21 启动构建：
 
 ```powershell
-.\scripts\dev.ps1 -IdeaHome '<IDEA_HOME>'
+.\scripts\dev.ps1 -JavaHome '<JDK_21_HOME>'
 ```
 
 安装 ZIP 输出到 `build/distributions/`。`-IdeaHome` 只提供构建 JDK；若需复用下载好的 2024.1 SDK，另传 `-PlatformPath`。旧参数 `-Compatibility2024` 保留接受，所有构建都输出统一的兼容包。
@@ -57,6 +57,7 @@ bash gradlew test buildPlugin verifyPluginStructure
 ## 文档
 
 - [安装与验收](docs/TRY-2024.md)
+- [报告浏览与逐问题确认](docs/REPORTS.md)
 - [IDE 兼容范围与验证](docs/COMPATIBILITY.md)
 - [通用关联上下文与规则声明](docs/RULE-CONTEXT.md)
 - [功能验收示例与小人状态](examples/functional-test/README.md)
@@ -70,3 +71,5 @@ API Key 通过 IDEA PasswordSafe 保存，不写入项目 XML。代码和规则�
 插件不修改源码、不阻塞提交、不自动 fetch/pull/push；自动检查仅接入 IDEA 提交成功回调，不监听终端提交。读取使用严格 UTF-8，大小、批次和关联上下文有上限；失败与未完成范围明确显示。模型判断可能存在误报或漏报。
 
 仓库保留 [MIT LICENSE](LICENSE)。原始素材相关许可与来源说明见 [像素素材记录](docs/ARTWORK-PIXEL.md)。本项目不是 DeepSeek 或 JetBrains 官方产品。
+
+1.1.5在1.1.4基础上精简报告界面，默认使用当前项目仓库。分支范围/Diff位于审查文件右键菜单，报告导出/清理位于任务目录右键菜单。

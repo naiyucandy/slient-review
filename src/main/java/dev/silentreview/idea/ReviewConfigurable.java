@@ -98,7 +98,7 @@ public final class ReviewConfigurable implements Configurable {
     }
     private String relativeToProject(Path selected){
         try{
-            String base=project.getBasePath();
+            String base=ReadAction.compute(project::getBasePath);
             if(base!=null&&!base.isBlank()){
                 Path root=Path.of(base).toAbsolutePath().normalize();
                 if(selected.startsWith(root))return root.relativize(selected).toString().replace('\\','/');

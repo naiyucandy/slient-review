@@ -15,7 +15,7 @@ val localBuildBranch = localPlatformPath?.let {
 require(localBuildBranch == null || localBuildBranch == 241) {
     "Build the distribution with an IntelliJ 2024.1 SDK; use verificationIdePaths to check newer IDEs"
 }
-version = "1.1.1"
+version = "1.1.5"
 
 repositories {
     mavenCentral()
